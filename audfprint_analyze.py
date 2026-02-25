@@ -58,6 +58,8 @@ DENSITY = 20.0
 # OVERSAMP > 1 tries to generate extra landmarks by decaying faster
 OVERSAMP = 1
 # 512 pt FFT @ 11025 Hz, 50% hop
+
+
 # t_win = 0.0464
 # t_hop = 0.0232
 # Just specify n_fft
@@ -149,6 +151,10 @@ class Analyzer(object):
         self.soundfilecount = 0
         # Control behavior on file reading error
         self.fail_on_error = True
+        # Mid-channel cancellation for speech removal (0.0 = normal, 1.0 = pure side channel)
+        self.mid_cancel = 0.0
+        # Frequency weights for peak selection (None = uniform weighting)
+        self.freq_weights = None
 
     def spreadpeaksinvector(self, vector, width=4.0):
         """ Create a blurred version of vector, where each of the local maxes
@@ -199,6 +205,9 @@ class Analyzer(object):
     def _decaying_threshold_fwd_prune(self, sgram, a_dec):
         """ forward pass of findpeaks
             initial threshold envelope based on peaks in first 10 frames
+            
+            If speech_robust mode is enabled, peaks are weighted by frequency
+            to favor lower frequencies which survive speech masking better.
         """
         (srows, scols) = np.shape(sgram)
         sthresh = self.spreadpeaksinvector(
@@ -210,15 +219,28 @@ class Analyzer(object):
         # optimization of mask update
         __sp_pts = len(sthresh)
         __sp_v = self.__sp_vals
+        
+        # Get frequency weights if in speech-robust mode
+        freq_weights = self.freq_weights
 
         for col in range(scols):
             s_col = sgram[:, col]
             # Find local magnitude peaks that are above threshold
             sdmaxposs = np.nonzero(locmax(s_col) * (s_col > sthresh))[0]
-            # Work down list of peaks in order of their absolute value
-            # above threshold
-            valspeaks = sorted(zip(s_col[sdmaxposs], sdmaxposs), reverse=True)
-            for val, peakpos in valspeaks[:self.maxpksperframe]:
+            
+            # Work down list of peaks in order of their (weighted) value above threshold
+            if freq_weights is not None:
+                # Apply frequency weights: multiply peak value by weight for sorting
+                # This makes low-frequency peaks more likely to be selected
+                weighted_vals = [(s_col[pos] * freq_weights[pos], pos) for pos in sdmaxposs]
+                valspeaks = sorted(weighted_vals, reverse=True)
+            else:
+                # Original behavior: sort by raw value
+                valspeaks = sorted(zip(s_col[sdmaxposs], sdmaxposs), reverse=True)
+            
+            for _, peakpos in valspeaks[:self.maxpksperframe]:
+                # Use the actual (unweighted) value for threshold update
+                val = s_col[peakpos]
                 # What we actually want
                 # sthresh = spreadpeaks([(peakpos, s_col[peakpos])],
                 #                      base=sthresh, width=f_sd)
@@ -231,14 +253,28 @@ class Analyzer(object):
         return peaks
 
     def _decaying_threshold_bwd_prune_peaks(self, sgram, peaks, a_dec):
-        """ backwards pass of findpeaks """
+        """ backwards pass of findpeaks
+        
+            If speech_robust mode is enabled, peaks are weighted by frequency
+            to maintain consistency with forward pass weighting.
+        """
         scols = np.shape(sgram)[1]
         # Backwards filter to prune peaks
         sthresh = self.spreadpeaksinvector(sgram[:, -1], self.f_sd)
+        freq_weights = self.freq_weights
+        
         for col in range(scols, 0, -1):
             pkposs = np.nonzero(peaks[:, col - 1])[0]
             peakvals = sgram[pkposs, col - 1]
-            for val, peakpos in sorted(zip(peakvals, pkposs), reverse=True):
+            
+            if freq_weights is not None:
+                # Apply frequency weights for consistent ordering with forward pass
+                weighted_vals = [(val * freq_weights[pos], val, pos) for val, pos in zip(peakvals, pkposs)]
+                sorted_peaks = [(val, pos) for _, val, pos in sorted(weighted_vals, reverse=True)]
+            else:
+                sorted_peaks = sorted(zip(peakvals, pkposs), reverse=True)
+            
+            for val, peakpos in sorted_peaks:
                 if val >= sthresh[peakpos]:
                     # Setup the threshold
                     sthresh = self.spreadpeaks([(peakpos, val)], base=sthresh,
@@ -313,6 +349,9 @@ class Analyzer(object):
             pklist is a column-sorted list of (col, bin) pairs as created
             by findpeaks().
             Return a list of (col, peak, peak2, col2-col) landmark descriptors.
+            
+            If speech_robust mode is enabled, pairs are prioritized by
+            frequency weight of both peaks (lower frequencies preferred).
         """
         # Form pairs of peaks into landmarks
         landmarks = []
@@ -323,22 +362,44 @@ class Analyzer(object):
             peaks_at = [[] for _ in range(scols)]
             for (col, bin_) in pklist:
                 peaks_at[col].append(bin_)
+            
+            freq_weights = self.freq_weights  # None if not speech_robust
 
             # Build list of landmarks <starttime F1 endtime F2>
             for col in range(scols):
                 for peak in peaks_at[col]:
                     pairsthispeak = 0
-                    for col2 in range(col + self.mindt,
-                                       min(scols, col + self.targetdt)):
-                        if pairsthispeak < self.maxpairsperpeak:
+                    
+                    if freq_weights is not None:
+                        # Speech-robust: collect all valid pairs and sort by combined weight
+                        candidate_pairs = []
+                        for col2 in range(col + self.mindt,
+                                           min(scols, col + self.targetdt)):
                             for peak2 in peaks_at[col2]:
                                 if abs(peak2 - peak) < self.targetdf:
-                                    # and abs(peak2-peak) + abs(col2-col) > 2 ):
-                                    if pairsthispeak < self.maxpairsperpeak:
-                                        # We have a pair!
-                                        landmarks.append((col, peak,
-                                                          peak2, col2 - col))
-                                        pairsthispeak += 1
+                                    # Combined weight: average of both peak weights
+                                    combined_weight = (freq_weights[peak] + freq_weights[peak2]) / 2
+                                    candidate_pairs.append((combined_weight, col2, peak2))
+                        
+                        # Sort by weight (highest first = lowest frequency preferred)
+                        candidate_pairs.sort(reverse=True)
+                        
+                        # Take top maxpairsperpeak pairs
+                        for _, col2, peak2 in candidate_pairs[:self.maxpairsperpeak]:
+                            landmarks.append((col, peak, peak2, col2 - col))
+                    else:
+                        # Original behavior: first-come-first-served
+                        for col2 in range(col + self.mindt,
+                                           min(scols, col + self.targetdt)):
+                            if pairsthispeak < self.maxpairsperpeak:
+                                for peak2 in peaks_at[col2]:
+                                    if abs(peak2 - peak) < self.targetdf:
+                                        # and abs(peak2-peak) + abs(col2-col) > 2 ):
+                                        if pairsthispeak < self.maxpairsperpeak:
+                                            # We have a pair!
+                                            landmarks.append((col, peak,
+                                                              peak2, col2 - col))
+                                            pairsthispeak += 1
 
         return landmarks
 
@@ -355,7 +416,8 @@ class Analyzer(object):
         else:
             try:
                 # [d, sr] = librosa.load(filename, sr=self.target_sr)
-                d, sr = audio_read.audio_read(filename, sr=self.target_sr, channels=1)
+                d, sr = audio_read.audio_read(filename, sr=self.target_sr, channels=1,
+                                              mid_cancel=self.mid_cancel)
             except Exception as e:  # audioread.NoBackendError:
                 message = "wavfile2peaks: Error reading " + filename
                 if self.fail_on_error:

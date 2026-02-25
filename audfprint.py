@@ -296,6 +296,8 @@ def setup_analyzer(args):
         # Default shift is 4 for match, otherwise 1
         analyzer.shifts = 4 if args['match'] else 1
     analyzer.fail_on_error = not args['--continue-on-error']
+    # Mid-channel cancellation for speech removal in podcasts
+    analyzer.mid_cancel = float(args['--mid-cancel'])
     return analyzer
 
 
@@ -382,6 +384,7 @@ Options:
   -J, --illustrate-hpf            Plot the match, using onset enhancement
   -W <dir>, --wavdir <dir>        Find sound files under this dir [default: ]
   -V <ext>, --wavext <ext>        Extension to add to wav file names [default: ]
+  -M <val>, --mid-cancel <val>    Cancel center/mid channel (0.0=normal, 1.0=full) [default: 0.0]
   --version                       Report version number
   --help                          Print this message
 """

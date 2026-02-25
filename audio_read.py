@@ -53,10 +53,19 @@ def wavread(filename):
   return data, samplerate
 
 
-def audio_read(filename, sr=None, channels=None):
-    """Read a soundfile, return (d, sr)."""
+def audio_read(filename, sr=None, channels=None, mid_cancel=0.0):
+    """Read a soundfile, return (d, sr).
+    
+    Args:
+        filename: Path to audio file
+        sr: Target sample rate (None = native)
+        channels: Number of channels (1 = mono, 2 = stereo, None = native)
+        mid_cancel: Amount of center/mid channel to cancel (0.0 = normal mono,
+                   1.0 = pure side channel L-R). Values between 0-1 blend.
+                   This helps detect music under speech in podcasts.
+    """
     if HAVE_FFMPEG:
-        return audio_read_ffmpeg(filename, sr, channels)
+        return audio_read_ffmpeg(filename, sr, channels, mid_cancel=mid_cancel)
     else:
         data, samplerate = wavread(filename)
         if channels == 1 and len(data.shape) == 2 and data.shape[-1] != 1:
@@ -68,22 +77,31 @@ def audio_read(filename, sr=None, channels=None):
         return data, samplerate
 
 
-def audio_read_ffmpeg(filename, sr=None, channels=None):
-    """Read a soundfile, return (d, sr)."""
+def audio_read_ffmpeg(filename, sr=None, channels=None, mid_cancel=0.0):
+    """Read a soundfile, return (d, sr).
+    
+    Args:
+        mid_cancel: 0.0 = normal mono (L+R), 1.0 = pure side (L-R)
+                   Values between blend: output = (1-mid_cancel)*(L+R) + mid_cancel*(L-R)
+    """
     # Hacked version of librosa.load and audioread/ff.
     offset = 0.0
     duration = None
     dtype = np.float32
     y = []
+    
+    # If mid_cancel is set, we need stereo to do the processing
+    request_channels = 2 if (mid_cancel > 0 and channels == 1) else channels
+    
     with FFmpegAudioFile(os.path.realpath(filename),
-                         sample_rate=sr, channels=channels) as input_file:
+                         sample_rate=sr, channels=request_channels) as input_file:
         sr = input_file.sample_rate
-        channels = input_file.channels
-        s_start = int(np.floor(sr * offset) * channels)
+        actual_channels = input_file.channels
+        s_start = int(np.floor(sr * offset) * actual_channels)
         if duration is None:
             s_end = np.inf
         else:
-            s_end = s_start + int(np.ceil(sr * duration) * channels)
+            s_end = s_start + int(np.ceil(sr * duration) * actual_channels)
         num_read = 0
         for frame in input_file:
             frame = buf_to_float(frame, dtype=dtype)
@@ -109,11 +127,35 @@ def audio_read_ffmpeg(filename, sr=None, channels=None):
             y = np.zeros(0, dtype=dtype)
         else:
             y = np.concatenate(y)
-            if channels > 1:
+            if actual_channels > 1:
                 y = y.reshape((-1, 2)).T
 
     # Final cleanup for dtype and contiguity
     y = np.ascontiguousarray(y, dtype=dtype)
+    
+    # Apply mid-channel cancellation if requested (for speech removal)
+    # 
+    # CROSSFADE APPROACH (user proposal):
+    # 1. Compute normalized mono: (L + R) / 2
+    # 2. Compute full side channel: L - R (NOT normalized - this is the 100% output)
+    # 3. Crossfade: output = (1 - mid_cancel) * mono + mid_cancel * side
+    #
+    # This gives:
+    # - mid_cancel=0: (L+R)/2 (normal mono)
+    # - mid_cancel=0.5: 0.5*(L+R)/2 + 0.5*(L-R) = (L+R)/4 + (L-R)/2 = (3L-R)/4
+    # - mid_cancel=1.0: L-R (full side, speech cancelled)
+    #
+    # The side channel is NOT normalized, so it has more weight at intermediate
+    # values, progressively bringing in more of the speech-cancelled signal.
+    if mid_cancel > 0 and len(y.shape) == 2 and y.shape[0] == 2:
+        L, R = y[0], y[1]
+        mono = (L + R) / 2.0  # Normalized mono (original audio)
+        side = L - R          # Full side channel (100% mid-cancel output)
+        # Crossfade between normalized mono and full side
+        y = (1.0 - mid_cancel) * mono + mid_cancel * side
+    elif channels == 1 and len(y.shape) == 2:
+        # Standard mono conversion if no mid_cancel but we got stereo
+        y = np.mean(y, axis=0)
 
     return (y, sr)
 
