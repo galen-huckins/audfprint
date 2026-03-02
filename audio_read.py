@@ -88,7 +88,6 @@ def audio_read_ffmpeg(filename, sr=None, channels=None, mid_cancel=0.0):
     offset = 0.0
     duration = None
     dtype = np.float32
-    y = []
     
     # If mid_cancel is set, we need stereo to do the processing
     request_channels = 2 if (mid_cancel > 0 and channels == 1) else channels
@@ -102,6 +101,22 @@ def audio_read_ffmpeg(filename, sr=None, channels=None, mid_cancel=0.0):
             s_end = np.inf
         else:
             s_end = s_start + int(np.ceil(sr * duration) * actual_channels)
+        
+        # Pre-allocate a contiguous buffer based on duration estimate.
+        # This avoids appending hundreds of small numpy arrays and then
+        # concatenating, which fragments CPython's memory allocator and
+        # causes memory that is never returned to the OS.
+        est_samples = 0
+        if hasattr(input_file, 'duration') and input_file.duration > 0:
+            est_samples = int(input_file.duration * sr * actual_channels) + sr  # +1s padding
+        
+        if est_samples > 0:
+            y_buf = np.empty(est_samples, dtype=dtype)
+            y_pos = 0  # write cursor into y_buf
+        else:
+            y_buf = None
+            y_list = []  # fallback to list-append if duration unknown
+        
         num_read = 0
         for frame in input_file:
             frame = buf_to_float(frame, dtype=dtype)
@@ -119,16 +134,39 @@ def audio_read_ffmpeg(filename, sr=None, channels=None, mid_cancel=0.0):
             if num_read_prev <= s_start < num_read:
                 # beginning is in this frame
                 frame = frame[(s_start - num_read_prev):]
-            # tack on the current frame
-            y.append(frame)
+            
+            # Write into pre-allocated buffer (or fallback to list)
+            if y_buf is not None:
+                end_pos = y_pos + len(frame)
+                if end_pos > len(y_buf):
+                    # Duration estimate was short — grow buffer by 50%
+                    new_size = max(end_pos, int(len(y_buf) * 1.5))
+                    new_buf = np.empty(new_size, dtype=dtype)
+                    new_buf[:y_pos] = y_buf[:y_pos]
+                    y_buf = new_buf
+                y_buf[y_pos:end_pos] = frame
+                y_pos = end_pos
+            else:
+                y_list.append(frame)
 
-        if not len(y):
-            # Zero-length read
-            y = np.zeros(0, dtype=dtype)
-        else:
-            y = np.concatenate(y)
-            if actual_channels > 1:
+        # Build final array from buffer or list
+        if y_buf is not None:
+            if y_pos == 0:
+                y = np.zeros(0, dtype=dtype)
+            else:
+                # Slice to actual size — this is a view, not a copy
+                y = y_buf[:y_pos].copy()
+                del y_buf  # Release the over-sized buffer immediately
+            if actual_channels > 1 and y.size > 0:
                 y = y.reshape((-1, 2)).T
+        else:
+            if not len(y_list):
+                y = np.zeros(0, dtype=dtype)
+            else:
+                y = np.concatenate(y_list)
+                del y_list
+                if actual_channels > 1:
+                    y = y.reshape((-1, 2)).T
 
     # Final cleanup for dtype and contiguity
     y = np.ascontiguousarray(y, dtype=dtype)

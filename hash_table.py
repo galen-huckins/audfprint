@@ -152,13 +152,24 @@ class HashTable(object):
             associated with each element in hashes array of [time, hash] rows.
             This version has get_entry() inlined, it's about 30% faster.
         """
-        # Allocate to largest possible number of hits
+        # Pre-count exact number of hits to allocate the right-sized array.
+        # The old approach allocated nhashes*depth (worst-case), then called
+        # resize() which doesn't free memory — causing allocator fragmentation
+        # across many scans in a long-running worker.
         nhashes = np.shape(hashes)[0]
-        hits = np.zeros((nhashes * self.depth, 4), np.int32)
-        nhits = 0
-        maxtimemask = (1 << self.maxtimebits) - 1
         hashmask = (1 << self.hashbits) - 1
-        # Fill in
+        maxtimemask = (1 << self.maxtimebits) - 1
+        
+        # First pass: count total hits
+        total_hits = 0
+        for ix in range(nhashes):
+            hash_ = hashmask & hashes[ix][1]
+            total_hits += min(self.depth, self.counts[hash_])
+        
+        # Allocate exact size
+        hits = np.empty((total_hits, 4), np.int32)
+        nhits = 0
+        # Second pass: fill in
         for ix in range(nhashes):
             time_ = hashes[ix][0]
             hash_ = hashmask & hashes[ix][1]
@@ -171,8 +182,6 @@ class HashTable(object):
             hits[hitrows, 2] = hash_
             hits[hitrows, 3] = time_
             nhits += nids
-        # Discard the excess rows
-        hits.resize((nhits, 4))
         return hits
 
     def save(self, name, params=None, file_object=None):

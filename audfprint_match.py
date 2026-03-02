@@ -301,8 +301,13 @@ class Matcher(object):
                                         urank, min_time, max_time]
                 nresults += 1
                 if nresults >= results.shape[0]:
-                    results = np.vstack([results, np.zeros(results.shape,
-                                                           np.int32)])
+                    # Grow by 50% + 8 instead of doubling with np.vstack.
+                    # vstack creates a copy + leaves the old arrays as garbage,
+                    # fragmenting the allocator in a long-running worker.
+                    new_size = results.shape[0] + max(8, results.shape[0] // 2)
+                    new_results = np.empty((new_size, 7), np.int32)
+                    new_results[:nresults] = results[:nresults]
+                    results = new_results
                 # Clear this hit to find next largest.
                 filtered_bincounts[max(0, mode - self.window):
                                    (mode + self.window + 1)] = 0
