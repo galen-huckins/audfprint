@@ -173,7 +173,7 @@ def audio_read_ffmpeg(filename, sr=None, channels=None, mid_cancel=0.0):
     
     # Apply mid-channel cancellation if requested (for speech removal)
     # 
-    # CROSSFADE APPROACH (user proposal):
+    # CROSSFADE APPROACH:
     # 1. Compute normalized mono: (L + R) / 2
     # 2. Compute full side channel: L - R (NOT normalized - this is the 100% output)
     # 3. Crossfade: output = (1 - mid_cancel) * mono + mid_cancel * side
@@ -186,11 +186,19 @@ def audio_read_ffmpeg(filename, sr=None, channels=None, mid_cancel=0.0):
     # The side channel is NOT normalized, so it has more weight at intermediate
     # values, progressively bringing in more of the speech-cancelled signal.
     if mid_cancel > 0 and len(y.shape) == 2 and y.shape[0] == 2:
-        L, R = y[0], y[1]
-        mono = (L + R) / 2.0  # Normalized mono (original audio)
-        side = L - R          # Full side channel (100% mid-cancel output)
-        # Crossfade between normalized mono and full side
-        y = (1.0 - mid_cancel) * mono + mid_cancel * side
+        if mid_cancel >= 1.0:
+            # Fast path: pure side channel (L-R). Avoids creating 3 intermediate
+            # arrays (mono, side, blended) — saves ~3× the audio size in peak memory.
+            # This is the most common case (mid_cancel=1.0 is the default).
+            y = np.subtract(y[0], y[1], dtype=np.float32)
+        else:
+            # Blended: crossfade between mono and side channel
+            L, R = y[0], y[1]
+            mono = (L + R) / 2.0  # Normalized mono (original audio)
+            side = L - R          # Full side channel (100% mid-cancel output)
+            # Crossfade between normalized mono and full side
+            y = (1.0 - mid_cancel) * mono + mid_cancel * side
+            del L, R, mono, side  # Release intermediates immediately
     elif channels == 1 and len(y.shape) == 2:
         # Standard mono conversion if no mid_cancel but we got stereo
         y = np.mean(y, axis=0)
