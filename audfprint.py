@@ -307,6 +307,9 @@ def setup_matcher(args):
     matcher = audfprint_match.Matcher()
     matcher.window = int(args['--match-win'])
     matcher.threshcount = int(args['--min-count'])
+    # BLUEDOT: Optional lower gate threshold for candidate selection
+    if args['--min-count-gate']:
+        matcher.threshcount_gate = int(args['--min-count-gate'])
     matcher.max_returns = int(args['--max-matches'])
     matcher.search_depth = int(args['--search-depth'])
     matcher.sort_by_time = args['--sortbytime']
@@ -364,6 +367,7 @@ Options:
   -i <val>, --shifts <val>        Use this many subframe shifts building fp [default: 0]
   -w <val>, --match-win <val>     Maximum tolerable frame skew to count as a match [default: 2]
   -N <val>, --min-count <val>     Minimum number of matching landmarks to count as a match [default: 5]
+  --min-count-gate <val>           Lower gate threshold for candidate selection (peak-bin); defaults to min-count
   -x <val>, --max-matches <val>   Maximum number of matches to report for each query [default: 1]
   -X, --exact-count               Flag to use more precise (but slower) match counting
   -R, --find-time-range           Report the time support of each match

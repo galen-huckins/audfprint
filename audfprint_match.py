@@ -97,8 +97,28 @@ class Matcher(object):
         """Set up default object values"""
         # Tolerance window for time differences
         self.window = 1
-        # Absolute minimum number of matching hashes to count as a match
+        # Absolute minimum number of matching hashes to count as a match.
+        # Applied to the WINDOWED count (sum of bins within ±window of peak).
+        # This is the final output threshold — matches below this are not reported.
         self.threshcount = 5
+        # Gate threshold for candidate selection in _best_count_ids and
+        # _approx_match_counts.  Applied to the SINGLE PEAK BIN count
+        # (before windowing).  This is a cheaper pre-filter that determines
+        # whether a candidate is worth computing the full windowed count for.
+        #
+        # BLUEDOT MODIFICATION (2026-03-10): Decoupled from threshcount.
+        # In upstream audfprint, threshcount was used for both purposes.
+        # For podcast scanning with speech-masked music at density=50,
+        # the single-bin peak is often much lower than the windowed count
+        # (e.g., peak=26 but windowed=59 for a real match).  Using a high
+        # threshcount (like 40) for the gate incorrectly rejects these
+        # matches before the windowed count is ever computed.
+        #
+        # Default: None means "use threshcount" (preserves original behavior
+        # when not explicitly set).  Set to a lower value (e.g., 10) to
+        # allow more candidates through the gate while still filtering on
+        # the final windowed count via threshcount.
+        self.threshcount_gate = None
         # How many hits to return?
         self.max_returns = 1
         # How deep to search in return list?
@@ -121,6 +141,11 @@ class Matcher(object):
         # alignments, stop looking after a while.
         self.max_alignments_per_id = 100
 
+    @property
+    def _gate_thresh(self):
+        """Effective gate threshold: threshcount_gate if set, else threshcount."""
+        return self.threshcount_gate if self.threshcount_gate is not None else self.threshcount
+
     def _best_count_ids(self, hits, ht):
         """ Return the indexes for the ids with the best counts.
             hits is a matrix as returned by hash_table.get_hits()
@@ -137,10 +162,11 @@ class Matcher(object):
 
         # Find all the actual hits for a the most popular ids
         bestcountsixs = np.argsort(wtdcounts)[::-1]
-        # We will examine however many hits have rawcounts above threshold
-        # up to a maximum of search_depth.
+        # We will examine however many hits have rawcounts above the gate
+        # threshold, up to a maximum of search_depth.
+        # BLUEDOT: Uses _gate_thresh (decoupled) instead of threshcount.
         maxdepth = np.minimum(np.count_nonzero(np.greater(rawcounts,
-                                                          self.threshcount)),
+                                                          self._gate_thresh)),
                               self.search_depth)
         # Return the ids to check
         bestcountsixs = bestcountsixs[:maxdepth]
@@ -218,9 +244,11 @@ class Matcher(object):
         min_time = 0
         max_time = 0
         for urank, (id, rawcount) in enumerate(zip(ids, rawcounts)):
+            # BLUEDOT: Use _gate_thresh for mode-finding (single-bin gate),
+            # but threshcount for the final filtered count check.
             modes, counts = find_modes(alltimes[np.nonzero(allids == id)[0]],
                                        window=self.window,
-                                       threshold=self.threshcount)
+                                       threshold=self._gate_thresh)
             for mode in modes:
                 matchhashes = self._unique_match_hashes(id, sorted_hits, mode)
                 # Now we get the exact count
@@ -288,12 +316,25 @@ class Matcher(object):
             found_this_id = 0
             while still_looking:
                 mode = np.argmax(filtered_bincounts)
-                if filtered_bincounts[mode] <= self.threshcount:
-                    # Too few - skip to the next id
+                # BLUEDOT: Gate check uses _gate_thresh (single peak bin),
+                # while the final count is checked against threshcount below.
+                if filtered_bincounts[mode] <= self._gate_thresh:
+                    # Too few in peak bin - skip to the next id
                     still_looking = False
                     continue
                 count = np.sum(bincounts[max(0, mode - self.window):
                                          (mode + self.window + 1)])
+                # BLUEDOT: Apply threshcount to the windowed count.
+                # This is the actual match quality filter — if the windowed
+                # count doesn't meet the threshold, skip this alignment.
+                if count < self.threshcount:
+                    # Windowed count too low, clear this peak and keep looking
+                    filtered_bincounts[max(0, mode - self.window):
+                                       (mode + self.window + 1)] = 0
+                    found_this_id += 1
+                    if found_this_id > self.max_alignments_per_id:
+                        still_looking = False
+                    continue
                 if self.find_time_range:
                     min_time, max_time = self._calculate_time_ranges(
                             sorted_hits, id, mode + mintime)
